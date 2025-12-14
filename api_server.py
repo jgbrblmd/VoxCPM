@@ -22,16 +22,19 @@ sys.path.insert(0, str(project_root / "src"))
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 import uvicorn
 
-# Global variables - minimal for now
+# Global variables - true multi-GPU approach
 task_queue = Queue()
 task_status: Dict[str, Dict] = {}
 task_lock = threading.Lock()
-worker_thread = None
-current_model = None
-current_lora_path = None
-model_lock = threading.Lock()
+worker_threads = []  # Multiple worker threads
+current_models = {}  # Multiple model instances (GPU -> model)
+current_lora_paths = {}  # Track LoRA for each GPU
+model_locks = {}  # Separate lock for each GPU
+available_gpus = []  # List of available GPU devices
+max_concurrent_tasks = 2  # Number of GPUs for parallel processing
 
 # Task status constants
 class TaskStatus:
@@ -51,22 +54,79 @@ class TTSRequest(BaseModel):
     ref_text: Optional[str] = None
     async_mode: bool = True
 
-# Initialize FastAPI app with minimal configuration
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager."""
+    global worker_threads, max_concurrent_tasks, available_gpus, model_locks
+
+    # Startup
+    logger.info("Starting VoxCPM API server...")
+
+    # Detect available GPUs
+    available_gpus = detect_available_gpus()
+    max_concurrent_tasks = len(available_gpus)
+
+    # Initialize locks for each GPU
+    for gpu_id in available_gpus:
+        model_locks[gpu_id] = threading.Lock()
+
+    logger.info(f"Detected {len(available_gpus)} GPUs: {available_gpus}")
+    logger.info(f"Starting {max_concurrent_tasks} worker threads for true parallel processing")
+
+    # Start multiple worker threads, each bound to a specific GPU
+    for i in range(max_concurrent_tasks):
+        gpu_id = available_gpus[i]
+        worker_thread = threading.Thread(target=task_worker, args=(i, gpu_id), daemon=True)
+        worker_thread.start()
+        worker_threads.append(worker_thread)
+        logger.info(f"Background task worker {i} started for GPU {gpu_id}")
+
+    yield
+
+    # Shutdown
+    logger.info("Shutting down VoxCPM API server...")
+
+# Initialize FastAPI app with lifespan
 app = FastAPI(
-    title="VoxCPM LoRA TTS API (Final)",
-    description="Final version with real model support",
-    version="1.0.0"
+    title="VoxCPM LoRA TTS API (Multi-GPU)",
+    description="VoxCPM TTS API with multi-GPU support",
+    version="1.0.0",
+    lifespan=lifespan
 )
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize background worker during app startup."""
-    global worker_thread
+def detect_available_gpus():
+    """Detect available GPU devices."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return list(range(torch.cuda.device_count()))
+        else:
+            # For AMD GPUs, check for ROCm devices
+            try:
+                import subprocess
+                result = subprocess.run(["rocm-smi", "--showid"], capture_output=True, text=True)
+                if result.returncode == 0:
+                    # Parse ROCm output to get GPU IDs
+                    gpu_ids = []
+                    for line in result.stdout.split('\n'):
+                        if 'GPU' in line and 'Device' in line:
+                            # Extract GPU ID from ROCm output
+                            parts = line.split()
+                            for part in parts:
+                                if part.isdigit():
+                                    gpu_ids.append(int(part))
+                                    break
+                    return gpu_ids if gpu_ids else [0, 1]  # Default to 2 GPUs for AMD
+            except:
+                pass
 
-    # Start background worker thread
-    worker_thread = threading.Thread(target=task_worker, daemon=True)
-    worker_thread.start()
-    logger.info("Background task worker started")
+            # Default fallback
+            logger.warning("Could not detect GPUs, defaulting to 2 workers")
+            return [0, 1]
+
+    except ImportError:
+        logger.warning("PyTorch not available, defaulting to 2 workers")
+        return [0, 1]
 
 @app.get("/")
 async def root():
@@ -80,8 +140,18 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    with model_lock:
-        return {"status": "healthy", "model_loaded": current_model is not None}
+    loaded_gpus = []
+    for gpu_id in available_gpus:
+        if gpu_id in current_models and current_models[gpu_id] is not None:
+            loaded_gpus.append(gpu_id)
+
+    return {
+        "status": "healthy",
+        "model_loaded": len(loaded_gpus) > 0,  # Keep for backward compatibility
+        "available_gpus": available_gpus,
+        "loaded_gpus": loaded_gpus,
+        "max_concurrent_tasks": max_concurrent_tasks
+    }
 
 @app.get("/loras")
 async def list_loras():
@@ -144,8 +214,9 @@ async def synthesize_speech(request: TTSRequest):
                 "progress": 0.0
             }
         else:
-            # For sync mode, process immediately
-            result = process_task_real(task_id, request.model_dump())
+            # For sync mode, process immediately on first available GPU
+            gpu_id = available_gpus[0] if available_gpus else 0
+            result = process_task_real(task_id, request.model_dump(), 0, gpu_id)
 
             return {
                 "task_id": task_id,
@@ -187,7 +258,8 @@ async def list_tasks(status: Optional[str] = None, limit: int = 50):
             "tasks": tasks,
             "total": len(tasks),
             "processing": processing_count,
-            "max_concurrent": 1
+            "max_concurrent": max_concurrent_tasks,
+            "available_gpus": len(available_gpus)
         }
 
 @app.get("/download/{filename}")
@@ -204,18 +276,18 @@ async def download_file(filename: str):
         filename=filename
     )
 
-def load_model_with_lora(lora_name: Optional[str] = None):
-    """Load model with specified LoRA."""
-    global current_model, current_lora_path
+def load_model_with_lora(lora_name: Optional[str] = None, gpu_id: int = 0):
+    """Load model with specified LoRA on specific GPU."""
+    global current_models, current_lora_paths
 
-    with model_lock:
-        # Check if model already loaded with correct LoRA
-        if (current_model is not None and
-            lora_name == current_lora_path):
-            logger.info("Model already loaded with correct LoRA")
+    with model_locks[gpu_id]:
+        # Check if model already loaded with correct LoRA on this GPU
+        if (gpu_id in current_models and current_models[gpu_id] is not None and
+            lora_name == current_lora_paths.get(gpu_id)):
+            logger.info(f"Model already loaded on GPU {gpu_id} with correct LoRA")
             return
 
-        logger.info("Loading VoxCPM model...")
+        logger.info(f"Loading VoxCPM model on GPU {gpu_id}...")
 
         try:
             # Import here to avoid loading during startup
@@ -225,6 +297,13 @@ def load_model_with_lora(lora_name: Optional[str] = None):
             import torch
             import soundfile as sf
             from pydub import AudioSegment
+
+            # Set CUDA device before loading
+            if torch.cuda.is_available():
+                torch.cuda.set_device(gpu_id)
+                # Set environment variable for this thread
+                old_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
             # Default model path
             model_path = str(project_root / "models" / "openbmb__VoxCPM1.5")
@@ -241,9 +320,9 @@ def load_model_with_lora(lora_name: Optional[str] = None):
                     if loaded_config:
                         lora_config = loaded_config
 
-            # Load model
-            logger.info(f"Loading model: {model_path}")
-            current_model = VoxCPM.from_pretrained(
+            # Load model - it should automatically use the set CUDA device
+            logger.info(f"Loading model: {model_path} for GPU {gpu_id}")
+            model = VoxCPM.from_pretrained(
                 hf_model_id=model_path,
                 load_denoiser=False,
                 optimize=False,
@@ -251,13 +330,20 @@ def load_model_with_lora(lora_name: Optional[str] = None):
                 lora_weights_path=lora_weights_path,
             )
 
-            current_lora_path = lora_name
-            logger.info("Model loaded successfully")
+            # Restore CUDA_VISIBLE_DEVICES
+            if torch.cuda.is_available():
+                os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda_visible
+
+            current_models[gpu_id] = model
+            current_lora_paths[gpu_id] = lora_name
+            logger.info(f"Model loaded successfully on GPU {gpu_id}")
 
         except Exception as e:
-            logger.error(f"Error loading model: {e}")
-            current_model = None
-            current_lora_path = None
+            logger.error(f"Error loading model on GPU {gpu_id}: {e}")
+            if gpu_id in current_models:
+                current_models[gpu_id] = None
+            if gpu_id in current_lora_paths:
+                current_lora_paths[gpu_id] = None
             raise
 
 def get_default_lora_config():
@@ -309,18 +395,21 @@ def convert_to_mp3(audio_data, sample_rate, output_path):
     except Exception as e:
         logger.error(f"Error converting to MP3: {e}")
 
-def process_task_real(task_id: str, request_data: Dict):
-    """Process task with real model."""
+def process_task_real(task_id: str, request_data: Dict, worker_id: int = 0, gpu_id: int = 0):
+    """Process task with real model on specific GPU."""
     try:
-        update_task_status_safe(task_id, TaskStatus.PROCESSING, progress=0.0, message="开始处理任务...")
+        update_task_status_safe(task_id, TaskStatus.PROCESSING, progress=0.0,
+                             message=f"开始在GPU {gpu_id}处理任务...")
 
-        # Load model with specified LoRA
+        # Load model with specified LoRA on this GPU
         update_task_status_safe(task_id, TaskStatus.PROCESSING, progress=0.1, message="加载模型...")
         lora_name = request_data.get('lora_name')
-        load_model_with_lora(lora_name)
+        load_model_with_lora(lora_name, gpu_id)
 
-        if not current_model:
-            raise Exception("Failed to load model")
+        if gpu_id not in current_models or current_models[gpu_id] is None:
+            raise Exception(f"Failed to load model on GPU {gpu_id}")
+
+        model = current_models[gpu_id]
 
         update_task_status_safe(task_id, TaskStatus.PROCESSING, progress=0.2, message="准备生成参数...")
 
@@ -338,9 +427,9 @@ def process_task_real(task_id: str, request_data: Dict):
 
         update_task_status_safe(task_id, TaskStatus.PROCESSING, progress=0.3, message="生成音频中...")
 
-        # Generate audio
-        with model_lock:  # Ensure thread safety during generation
-            audio_np = current_model.generate(
+        # Generate audio on specific GPU with lock
+        with model_locks[gpu_id]:
+            audio_np = model.generate(
                 text=request_data['text'],
                 prompt_wav_path=ref_audio_path,
                 prompt_text=ref_text,
@@ -361,13 +450,13 @@ def process_task_real(task_id: str, request_data: Dict):
         output_path = os.path.join(output_dir, filename)
 
         # Convert to MP3
-        convert_to_mp3(audio_np, current_model.tts_model.sample_rate, output_path)
+        convert_to_mp3(audio_np, model.tts_model.sample_rate, output_path)
 
         update_task_status_safe(task_id, TaskStatus.COMPLETED, progress=1.0,
-                             message="语音合成完成", audio_path=output_path)
-        logger.info(f"Task {task_id} completed successfully")
+                             message=f"语音合成完成 (GPU {gpu_id})", audio_path=output_path)
+        logger.info(f"Task {task_id} completed successfully on GPU {gpu_id}")
 
-        return {"status": "completed", "audio_path": output_path, "message": "语音合成完成"}
+        return {"status": "completed", "audio_path": output_path, "message": f"语音合成完成"}
 
     except Exception as e:
         error_msg = f"Task failed: {str(e)}"
@@ -396,23 +485,22 @@ def update_task_status_safe(task_id: str, status: str, progress: float = None,
     except Exception as e:
         logger.error(f"Error updating task status: {e}")
 
-def task_worker():
-    """Background worker to process tasks from queue."""
-    logger.info("Task worker thread started")
+def task_worker(worker_id: int, gpu_id: int):
+    """Background worker to process tasks from queue on specific GPU."""
+    logger.info(f"Task worker {worker_id} started for GPU {gpu_id}")
+
     while True:
         try:
             task_id, request_data = task_queue.get(timeout=2.0)
             if task_id:
-                logger.info(f"Processing task {task_id}")
-                process_task_real(task_id, request_data)
+                logger.info(f"Worker {worker_id} (GPU {gpu_id}) processing task {task_id}")
+                process_task_real(task_id, request_data, worker_id, gpu_id)
         except Exception:
             continue
 
 if __name__ == "__main__":
     # Ensure output directory exists
     os.makedirs("api_outputs", exist_ok=True)
-
-    logger.info("Starting VoxCPM API server with real model support")
 
     # Run the API server
     uvicorn.run(
