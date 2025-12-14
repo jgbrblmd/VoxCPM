@@ -7,38 +7,52 @@ import torch
 import sys
 
 
-def patch_tensor_indexing():
+def patch_tensor_operations():
     """
-    Patch tensor indexing operations that may fail on ROCm.
+    Patch various tensor operations that may fail on ROCm.
     """
-    original_tensor_getitem = torch.Tensor.__getitem__
+    # Patch nonzero operation
+    original_nonzero = torch.Tensor.nonzero
 
-    def patched_getitem(self, key):
+    def patched_nonzero(self, *args, **kwargs):
         try:
-            return original_tensor_getitem(self, key)
-        except torch.cuda.OutOfMemoryError:
-            # If OOM on GPU, try on CPU
-            if self.is_cuda:
-                device = self.device
-                cpu_tensor = self.cpu()
-                result = original_tensor_getitem(cpu_tensor, key)
-                if hasattr(result, 'to'):
-                    return result.to(device)
-                return result
-            raise
+            return original_nonzero(self, *args, **kwargs)
         except RuntimeError as e:
             if "hipErrorInvalidDeviceFunction" in str(e):
-                # Try CPU fallback for HIP errors
+                # CPU fallback for nonzero operation
                 if self.is_cuda:
                     device = self.device
                     cpu_tensor = self.cpu()
-                    result = original_tensor_getitem(cpu_tensor, key)
+                    result = original_nonzero(cpu_tensor, *args, **kwargs)
                     if hasattr(result, 'to'):
                         return result.to(device)
                     return result
             raise
 
-    torch.Tensor.__getitem__ = patched_getitem
+    torch.Tensor.nonzero = patched_nonzero
+
+    # Patch eq operation for tensors
+    original_eq = torch.Tensor.__eq__
+
+    def patched_eq(self, other):
+        try:
+            return original_eq(self, other)
+        except RuntimeError as e:
+            if "hipErrorInvalidDeviceFunction" in str(e):
+                # CPU fallback for eq operation
+                if self.is_cuda:
+                    device = self.device
+                    cpu_self = self.cpu()
+                    cpu_other = other.cpu() if hasattr(other, 'cpu') and other.is_cuda else other
+                    result = original_eq(cpu_self, cpu_other)
+                    if hasattr(result, 'to'):
+                        return result.to(device)
+                    return result
+            raise
+
+    torch.Tensor.__eq__ = patched_eq
+
+    print("Applied tensor operations patch for ROCm")
 
 
 def patch_tensor_mask():
@@ -137,6 +151,12 @@ def apply_patches():
         patch_unique_consecutive()
 
         # Patch tensor operations
+        try:
+            patch_tensor_operations()
+            print("Applied tensor operations patch")
+        except Exception as e:
+            print(f"Failed to patch tensor operations: {e}")
+
         try:
             patch_tensor_mask()
             print("Applied tensor masking patch")

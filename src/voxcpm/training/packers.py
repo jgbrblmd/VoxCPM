@@ -37,10 +37,23 @@ class AudioFeatureProcessingPacker:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _first_pad_position(tokens: torch.Tensor):
-        positions = (tokens == -100).nonzero(as_tuple=True)
-        if positions[0].numel() == 0:
-            return None
-        return int(positions[0][0])
+        # ROCm compatibility: try GPU first, fallback to CPU if needed
+        try:
+            positions = (tokens == -100).nonzero(as_tuple=True)
+            if positions[0].numel() == 0:
+                return None
+            return int(positions[0][0])
+        except RuntimeError as e:
+            if "hipErrorInvalidDeviceFunction" in str(e) and tokens.is_cuda:
+                # Fallback to CPU for ROCm
+                device = tokens.device
+                cpu_tokens = tokens.cpu()
+                positions = (cpu_tokens == -100).nonzero(as_tuple=True)
+                if positions[0].numel() == 0:
+                    return None
+                return int(positions[0][0])
+            else:
+                raise
 
     def unpad_text_tokens(self, tokens: torch.Tensor):
         pad_pos = self._first_pad_position(tokens)

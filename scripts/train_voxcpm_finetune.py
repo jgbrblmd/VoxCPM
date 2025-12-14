@@ -17,6 +17,22 @@ from transformers import get_cosine_schedule_with_warmup
 import signal
 import os
 
+# Apply ROCm compatibility patches for AMD GPUs
+try:
+    import rocm_patch
+    rocm_patch.apply_patches()
+except ImportError:
+    pass  # Skip if rocm_patch is not available
+
+# Set ROCm environment variables for better compatibility
+if torch.cuda.is_available() and "rocm" in torch.__version__.lower():
+    os.environ["HIP_VISIBLE_DEVICES"] = "0"
+    os.environ["HSA_FORCE_FINE_GRAIN_PCIE"] = "1"
+    os.environ["PYTORCH_HIP_ALLOC_CONF"] = "garbage_collection_threshold:0.8,max_split_size_mb:128"
+    # Enable debugging for HIP errors
+    os.environ["AMD_SERIALIZE_KERNEL"] = "3"
+    print("ROCm environment variables set for training")
+
 try:
     from safetensors.torch import save_file
     SAFETENSORS_AVAILABLE = True
@@ -100,7 +116,7 @@ def train(
     if val_ds is not None:
         val_ds = val_ds.map(tokenize, batched=True, remove_columns=["text"])
 
-    dataset_cnt = int(max(train_ds["dataset_id"])) + 1 if "dataset_id" in train_ds.column_names else 1
+    dataset_cnt = int(max([x for x in train_ds["dataset_id"] if x is not None])) + 1 if "dataset_id" in train_ds.column_names else 1
     num_train_samples = len(train_ds)
 
     # ------------------------------------------------------------------ #

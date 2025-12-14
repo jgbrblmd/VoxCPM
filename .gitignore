@@ -3,3 +3,5 @@ __pycache__
 voxcpm.egg-info
 .DS_Store
 models
+lora
+examples
