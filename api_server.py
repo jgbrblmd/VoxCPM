@@ -2,220 +2,109 @@ import os
 import sys
 import time
 import json
-import tempfile
 from pathlib import Path
-from typing import Optional, List
-import shutil
+from typing import Optional, List, Dict
 import uuid
+import threading
+from queue import Queue
+from datetime import datetime
+import logging
+
+# Configure logging first
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Add src to sys.path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root / "src"))
 
-from voxcpm.core import VoxCPM
-from voxcpm.model.voxcpm import LoRAConfig
-import numpy as np
-import torch
-import soundfile as sf
-from pydub import AudioSegment
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+# Import FastAPI components
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
-import logging
+import uvicorn
 
-# Default pretrained model path relative to this repo
-default_pretrained_path = str(project_root / "models" / "openbmb__VoxCPM1.5")
+# Global variables - minimal for now
+task_queue = Queue()
+task_status: Dict[str, Dict] = {}
+task_lock = threading.Lock()
+worker_thread = None
+current_model = None
+current_lora_path = None
+model_lock = threading.Lock()
 
-# Global variables
-current_model: Optional[VoxCPM] = None
-current_lora_path: Optional[str] = None
+# Task status constants
+class TaskStatus:
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Pydantic models for request/response
+# Pydantic models
 class TTSRequest(BaseModel):
     text: str
     lora_name: Optional[str] = None
     cfg_scale: float = 2.0
     steps: int = 10
     seed: int = -1
-    # Optional voice cloning parameters
     ref_audio_path: Optional[str] = None
     ref_text: Optional[str] = None
+    async_mode: bool = True
 
-class TTSResponse(BaseModel):
-    task_id: str
-    status: str
-    message: str
-    audio_path: Optional[str] = None
-
-# Initialize FastAPI app
+# Initialize FastAPI app with minimal configuration
 app = FastAPI(
-    title="VoxCPM LoRA TTS API",
-    description="RESTful API for text-to-speech with LoRA model support",
+    title="VoxCPM LoRA TTS API (Final)",
+    description="Final version with real model support",
     version="1.0.0"
 )
 
-def get_default_lora_config():
-    """Return default LoRA config for hot-swapping support."""
-    return LoRAConfig(
-        enable_lm=True,
-        enable_dit=True,
-        r=32,
-        alpha=16,
-        target_modules_lm=["q_proj", "v_proj", "k_proj", "o_proj"],
-        target_modules_dit=["q_proj", "v_proj", "k_proj", "o_proj"]
-    )
+@app.on_event("startup")
+async def startup_event():
+    """Initialize background worker during app startup."""
+    global worker_thread
 
-def load_lora_config_from_checkpoint(lora_path):
-    """Load LoRA config from lora_config.json if available."""
-    lora_config_file = os.path.join(lora_path, "lora_config.json")
-    if os.path.exists(lora_config_file):
-        try:
-            with open(lora_config_file, "r", encoding="utf-8") as f:
-                lora_info = json.load(f)
-            lora_cfg_dict = lora_info.get("lora_config", {})
-            if lora_cfg_dict:
-                return LoRAConfig(**lora_cfg_dict), lora_info.get("base_model")
-        except Exception as e:
-            logger.warning(f"Failed to load lora_config.json: {e}")
-    return None, None
-
-def scan_lora_checkpoints(root_dir="lora"):
-    """Scan for LoRA checkpoints in the lora directory."""
-    checkpoints = []
-    if not os.path.exists(root_dir):
-        os.makedirs(root_dir, exist_ok=True)
-
-    for root, dirs, files in os.walk(root_dir):
-        if "lora_weights.safetensors" in files:
-            rel_path = os.path.relpath(root, root_dir)
-            checkpoints.append(rel_path)
-
-    return sorted(checkpoints, reverse=True)
-
-def load_model_with_lora(lora_name: Optional[str] = None):
-    """Load model with specified LoRA."""
-    global current_model, current_lora_path
-
-    base_model_path = default_pretrained_path
-
-    # If LoRA is specified, try to get base model from its config
-    if lora_name and lora_name != "None":
-        full_lora_path = os.path.join("lora", lora_name)
-        if os.path.exists(full_lora_path):
-            lora_config_file = os.path.join(full_lora_path, "lora_config.json")
-
-            if os.path.exists(lora_config_file):
-                try:
-                    with open(lora_config_file, "r", encoding="utf-8") as f:
-                        lora_info = json.load(f)
-                    saved_base_model = lora_info.get("base_model")
-
-                    if saved_base_model and os.path.exists(saved_base_model):
-                        base_model_path = saved_base_model
-                        logger.info(f"Using base model from LoRA config: {base_model_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to read base_model from LoRA config: {e}")
-
-    # Load model if not loaded or if LoRA changed
-    if (current_model is None or
-        (lora_name != current_lora_path and current_lora_path is not None)):
-
-        logger.info(f"Loading base model: {base_model_path}")
-
-        lora_config = None
-        lora_weights_path = None
-
-        if lora_name and lora_name != "None":
-            full_lora_path = os.path.join("lora", lora_name)
-            if os.path.exists(full_lora_path):
-                lora_weights_path = full_lora_path
-                lora_config, _ = load_lora_config_from_checkpoint(full_lora_path)
-                if lora_config:
-                    logger.info(f"Loaded LoRA config from {full_lora_path}/lora_config.json")
-                else:
-                    lora_config = get_default_lora_config()
-                    logger.info("Using default LoRA config")
-
-        if lora_config is None:
-            lora_config = get_default_lora_config()
-
-        current_model = VoxCPM.from_pretrained(
-            hf_model_id=base_model_path,
-            load_denoiser=False,
-            optimize=False,
-            lora_config=lora_config,
-            lora_weights_path=lora_weights_path,
-        )
-
-        current_lora_path = lora_name
-        logger.info("Model loaded successfully")
-
-    # Handle LoRA hot-swapping if model already loaded
-    elif lora_name and lora_name != "None" and lora_name != current_lora_path:
-        full_lora_path = os.path.join("lora", lora_name)
-        logger.info(f"Hot-loading LoRA: {full_lora_path}")
-        try:
-            current_model.load_lora(full_lora_path)
-            current_model.set_lora_enabled(True)
-            current_lora_path = lora_name
-        except Exception as e:
-            logger.error(f"Error loading LoRA: {e}")
-            raise HTTPException(status_code=500, detail=f"Error loading LoRA: {e}")
-
-    # Disable LoRA if None specified
-    elif lora_name == "None" or lora_name is None:
-        if current_model:
-            current_model.set_lora_enabled(False)
-            current_lora_path = None
-
-def convert_to_mp3(audio_data, sample_rate, output_path):
-    """Convert numpy audio data to MP3 format."""
-    # First save as WAV
-    temp_wav_path = output_path.replace('.mp3', '_temp.wav')
-    sf.write(temp_wav_path, audio_data, sample_rate)
-
-    # Convert to MP3
-    audio = AudioSegment.from_wav(temp_wav_path)
-    audio.export(output_path, format="mp3", bitrate="128k")
-
-    # Clean up temp file
-    os.remove(temp_wav_path)
+    # Start background worker thread
+    worker_thread = threading.Thread(target=task_worker, daemon=True)
+    worker_thread.start()
+    logger.info("Background task worker started")
 
 @app.get("/")
 async def root():
-    """Root endpoint with API information."""
+    """Root endpoint with basic info."""
     return {
         "message": "VoxCPM LoRA TTS API",
-        "version": "1.0.0",
-        "endpoints": {
-            "synthesize": "/synthesize",
-            "list_loras": "/loras",
-            "health": "/health"
-        }
+        "status": "running",
+        "version": "1.0.0"
     }
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "model_loaded": current_model is not None}
+    with model_lock:
+        return {"status": "healthy", "model_loaded": current_model is not None}
 
 @app.get("/loras")
 async def list_loras():
     """List available LoRA models."""
     try:
-        loras = scan_lora_checkpoints()
-        return {"loras": loras, "count": len(loras)}
+        lora_dir = "lora"
+        if not os.path.exists(lora_dir):
+            return {"loras": [], "count": 0}
+
+        checkpoints = []
+        for root, dirs, files in os.walk(lora_dir):
+            if "lora_weights.safetensors" in files:
+                rel_path = os.path.relpath(root, lora_dir)
+                checkpoints.append(rel_path)
+
+        return {"loras": sorted(checkpoints, reverse=True), "count": len(checkpoints)}
     except Exception as e:
         logger.error(f"Error listing LoRAs: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"loras": [], "count": 0, "error": str(e)}
 
 @app.post("/synthesize")
 async def synthesize_speech(request: TTSRequest):
-    """Synthesize speech from text with optional LoRA model."""
+    """Synthesize speech endpoint with real model support."""
     try:
         # Validate LoRA name if provided
         if request.lora_name and request.lora_name != "None":
@@ -226,71 +115,80 @@ async def synthesize_speech(request: TTSRequest):
                     detail=f"LoRA model '{request.lora_name}' not found"
                 )
 
-        # Load model with specified LoRA
-        load_model_with_lora(request.lora_name)
-
-        # Set seed if provided
-        if request.seed != -1:
-            torch.manual_seed(request.seed)
-            np.random.seed(request.seed)
-
-        # Handle reference audio if provided
-        final_prompt_wav = None
-        final_prompt_text = None
-
-        if request.ref_audio_path and request.ref_audio_path.strip():
-            if not os.path.exists(request.ref_audio_path):
-                raise HTTPException(
-                    status_code=404,
-                    detail="Reference audio file not found"
-                )
-
-            final_prompt_wav = request.ref_audio_path
-
-            # If no reference text provided, we'll proceed without it
-            # Note: In a production environment, you might want to add ASR here
-            if request.ref_text and request.ref_text.strip():
-                final_prompt_text = request.ref_text.strip()
-
-        # Generate audio
-        logger.info(f"Generating audio for text: {request.text[:50]}...")
-        audio_np = current_model.generate(
-            text=request.text,
-            prompt_wav_path=final_prompt_wav,
-            prompt_text=final_prompt_text,
-            cfg_value=request.cfg_scale,
-            inference_timesteps=request.steps,
-            denoise=False
-        )
-
-        # Create output directory
-        output_dir = "api_outputs"
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Generate unique filename
+        # Generate task ID
         task_id = str(uuid.uuid4())[:8]
-        timestamp = int(time.time())
-        filename = f"tts_{task_id}_{timestamp}.mp3"
-        output_path = os.path.join(output_dir, filename)
+        estimated_time = max(len(request.text) * 0.3 + request.steps, 30)
 
-        # Convert to MP3
-        convert_to_mp3(audio_np, current_model.tts_model.sample_rate, output_path)
+        # Initialize task status
+        with task_lock:
+            task_status[task_id] = {
+                "task_id": task_id,
+                "status": TaskStatus.PENDING,
+                "message": "任务已提交，等待处理...",
+                "progress": 0.0,
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "estimated_time": estimated_time
+            }
 
-        logger.info(f"Audio generated successfully: {output_path}")
+        if request.async_mode:
+            # Add to queue without blocking
+            task_queue.put((task_id, request.model_dump()))
+            logger.info(f"Task {task_id} queued for async processing")
 
-        return {
-            "task_id": task_id,
-            "status": "success",
-            "message": "Speech synthesized successfully",
-            "audio_path": output_path,
-            "sample_rate": current_model.tts_model.sample_rate
-        }
+            return {
+                "task_id": task_id,
+                "status": "submitted",
+                "message": "任务已提交，请使用task_id查询处理状态",
+                "estimated_time": estimated_time,
+                "progress": 0.0
+            }
+        else:
+            # For sync mode, process immediately
+            result = process_task_real(task_id, request.model_dump())
+
+            return {
+                "task_id": task_id,
+                "status": result.get("status", "unknown"),
+                "message": result.get("message", ""),
+                "audio_path": result.get("audio_path"),
+                "progress": result.get("progress", 0)
+            }
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error during synthesis: {e}")
         raise HTTPException(status_code=500, detail=f"Synthesis failed: {str(e)}")
+
+@app.get("/task/{task_id}")
+async def get_task_status(task_id: str):
+    """Get status of a specific task."""
+    with task_lock:
+        if task_id not in task_status:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+        task_info = task_status[task_id].copy()
+        return task_info
+
+@app.get("/tasks")
+async def list_tasks(status: Optional[str] = None, limit: int = 50):
+    """List all tasks."""
+    with task_lock:
+        tasks = list(task_status.values())
+        if status:
+            tasks = [task for task in tasks if task["status"] == status]
+        tasks.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        tasks = tasks[:limit]
+
+        processing_count = sum(1 for task in task_status.values() if task["status"] == "processing")
+
+        return {
+            "tasks": tasks,
+            "total": len(tasks),
+            "processing": processing_count,
+            "max_concurrent": 1
+        }
 
 @app.get("/download/{filename}")
 async def download_file(filename: str):
@@ -306,44 +204,221 @@ async def download_file(filename: str):
         filename=filename
     )
 
-@app.delete("/cleanup")
-async def cleanup_old_files():
-    """Clean up old generated files (older than 1 hour)."""
+def load_model_with_lora(lora_name: Optional[str] = None):
+    """Load model with specified LoRA."""
+    global current_model, current_lora_path
+
+    with model_lock:
+        # Check if model already loaded with correct LoRA
+        if (current_model is not None and
+            lora_name == current_lora_path):
+            logger.info("Model already loaded with correct LoRA")
+            return
+
+        logger.info("Loading VoxCPM model...")
+
+        try:
+            # Import here to avoid loading during startup
+            from voxcpm.core import VoxCPM
+            from voxcpm.model.voxcpm import LoRAConfig
+            import numpy as np
+            import torch
+            import soundfile as sf
+            from pydub import AudioSegment
+
+            # Default model path
+            model_path = str(project_root / "models" / "openbmb__VoxCPM1.5")
+
+            # Load LoRA config if available
+            lora_config = get_default_lora_config()
+            lora_weights_path = None
+
+            if lora_name and lora_name != "None":
+                lora_path = os.path.join("lora", lora_name)
+                if os.path.exists(lora_path):
+                    lora_weights_path = lora_path
+                    loaded_config, _ = load_lora_config_from_checkpoint(lora_path)
+                    if loaded_config:
+                        lora_config = loaded_config
+
+            # Load model
+            logger.info(f"Loading model: {model_path}")
+            current_model = VoxCPM.from_pretrained(
+                hf_model_id=model_path,
+                load_denoiser=False,
+                optimize=False,
+                lora_config=lora_config,
+                lora_weights_path=lora_weights_path,
+            )
+
+            current_lora_path = lora_name
+            logger.info("Model loaded successfully")
+
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            current_model = None
+            current_lora_path = None
+            raise
+
+def get_default_lora_config():
+    """Return default LoRA config."""
     try:
-        output_dir = "api_outputs"
-        if not os.path.exists(output_dir):
-            return {"message": "No files to clean", "deleted_count": 0}
+        from voxcpm.model.voxcpm import LoRAConfig
+        return LoRAConfig(
+            enable_lm=True,
+            enable_dit=True,
+            r=32,
+            alpha=16,
+            target_modules_lm=["q_proj", "v_proj", "k_proj", "o_proj"],
+            target_modules_dit=["q_proj", "v_proj", "k_proj", "o_proj"]
+        )
+    except Exception:
+        return None
 
-        current_time = time.time()
-        deleted_count = 0
+def load_lora_config_from_checkpoint(lora_path):
+    """Load LoRA config from checkpoint."""
+    try:
+        lora_config_file = os.path.join(lora_path, "lora_config.json")
+        if os.path.exists(lora_config_file):
+            with open(lora_config_file, "r", encoding="utf-8") as f:
+                lora_info = json.load(f)
+            lora_cfg_dict = lora_info.get("lora_config", {})
+            if lora_cfg_dict:
+                from voxcpm.model.voxcpm import LoRAConfig
+                return LoRAConfig(**lora_cfg_dict), lora_info.get("base_model")
+    except Exception:
+        pass
+    return None, None
 
-        for filename in os.listdir(output_dir):
-            file_path = os.path.join(output_dir, filename)
-            if os.path.isfile(file_path):
-                # Check if file is older than 1 hour
-                if current_time - os.path.getmtime(file_path) > 3600:
-                    os.remove(file_path)
-                    deleted_count += 1
+def convert_to_mp3(audio_data, sample_rate, output_path):
+    """Convert numpy audio data to MP3 format."""
+    try:
+        import soundfile as sf
+        from pydub import AudioSegment
 
-        return {
-            "message": "Cleanup completed",
-            "deleted_count": deleted_count
-        }
+        # Save as WAV first
+        temp_wav_path = output_path.replace('.mp3', '_temp.wav')
+        sf.write(temp_wav_path, audio_data, sample_rate)
+
+        # Convert to MP3
+        audio = AudioSegment.from_wav(temp_wav_path)
+        audio.export(output_path, format="mp3", bitrate="128k")
+
+        # Clean up temp file
+        os.remove(temp_wav_path)
     except Exception as e:
-        logger.error(f"Error during cleanup: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error converting to MP3: {e}")
+
+def process_task_real(task_id: str, request_data: Dict):
+    """Process task with real model."""
+    try:
+        update_task_status_safe(task_id, TaskStatus.PROCESSING, progress=0.0, message="开始处理任务...")
+
+        # Load model with specified LoRA
+        update_task_status_safe(task_id, TaskStatus.PROCESSING, progress=0.1, message="加载模型...")
+        lora_name = request_data.get('lora_name')
+        load_model_with_lora(lora_name)
+
+        if not current_model:
+            raise Exception("Failed to load model")
+
+        update_task_status_safe(task_id, TaskStatus.PROCESSING, progress=0.2, message="准备生成参数...")
+
+        # Set seed if provided
+        seed = request_data.get('seed', -1)
+        if seed != -1:
+            import torch
+            import numpy as np
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+        # Handle reference audio
+        ref_audio_path = request_data.get('ref_audio_path')
+        ref_text = request_data.get('ref_text')
+
+        update_task_status_safe(task_id, TaskStatus.PROCESSING, progress=0.3, message="生成音频中...")
+
+        # Generate audio
+        with model_lock:  # Ensure thread safety during generation
+            audio_np = current_model.generate(
+                text=request_data['text'],
+                prompt_wav_path=ref_audio_path,
+                prompt_text=ref_text,
+                cfg_value=request_data.get('cfg_scale', 2.0),
+                inference_timesteps=request_data.get('steps', 10),
+                denoise=False
+            )
+
+        update_task_status_safe(task_id, TaskStatus.PROCESSING, progress=0.8, message="保存音频文件...")
+
+        # Create output directory
+        output_dir = "api_outputs"
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Generate filename
+        timestamp = int(time.time())
+        filename = f"tts_{task_id}_{timestamp}.mp3"
+        output_path = os.path.join(output_dir, filename)
+
+        # Convert to MP3
+        convert_to_mp3(audio_np, current_model.tts_model.sample_rate, output_path)
+
+        update_task_status_safe(task_id, TaskStatus.COMPLETED, progress=1.0,
+                             message="语音合成完成", audio_path=output_path)
+        logger.info(f"Task {task_id} completed successfully")
+
+        return {"status": "completed", "audio_path": output_path, "message": "语音合成完成"}
+
+    except Exception as e:
+        error_msg = f"Task failed: {str(e)}"
+        update_task_status_safe(task_id, TaskStatus.FAILED, message=error_msg, error=str(e))
+        logger.error(f"Task {task_id} failed: {e}")
+        return {"status": "failed", "error": str(e)}
+
+def update_task_status_safe(task_id: str, status: str, progress: float = None,
+                           message: str = None, audio_path: str = None,
+                           error: str = None):
+    """Update task status safely."""
+    try:
+        with task_lock:
+            if task_id in task_status:
+                task_status[task_id]['status'] = status
+                task_status[task_id]['updated_at'] = datetime.now().isoformat()
+
+                if progress is not None:
+                    task_status[task_id]['progress'] = progress
+                if message:
+                    task_status[task_id]['message'] = message
+                if audio_path:
+                    task_status[task_id]['audio_path'] = audio_path
+                if error:
+                    task_status[task_id]['error'] = error
+    except Exception as e:
+        logger.error(f"Error updating task status: {e}")
+
+def task_worker():
+    """Background worker to process tasks from queue."""
+    logger.info("Task worker thread started")
+    while True:
+        try:
+            task_id, request_data = task_queue.get(timeout=2.0)
+            if task_id:
+                logger.info(f"Processing task {task_id}")
+                process_task_real(task_id, request_data)
+        except Exception:
+            continue
 
 if __name__ == "__main__":
-    import uvicorn
-
     # Ensure output directory exists
     os.makedirs("api_outputs", exist_ok=True)
 
-    # Run the API server on all network interfaces
+    logger.info("Starting VoxCPM API server with real model support")
+
+    # Run the API server
     uvicorn.run(
-        "api_server:app",
-        host="0.0.0.0",  # Listen on all network interfaces
+        app,
+        host="0.0.0.0",
         port=8000,
-        reload=False,    # Disable reload for production
+        reload=False,
         log_level="info"
     )

@@ -7,9 +7,12 @@
 - 🎵 **文本转语音**: 支持高质量的文字转语音合成
 - 🎭 **LoRA 模型支持**: 动态加载和切换不同的 LoRA 微调模型
 - 🎤 **声音克隆**: 支持使用参考音频进行声音克隆
+- ⚡ **异步处理**: 支持长文本异步处理，避免HTTP连接超时
+- 📊 **任务管理**: 实时任务状态跟踪和进度查询
 - 🎛️ **参数控制**: 可调节 CFG Scale、推理步数、随机种子等参数
 - 📁 **文件管理**: 自动生成和管理音频文件，支持 MP3 格式输出
 - 🔄 **热加载**: 智能模型缓存和热切换，提高响应速度
+- 🌐 **网络接口**: 支持所有网络接口访问，便于局域网使用
 
 ## 安装依赖
 
@@ -66,6 +69,22 @@ python test_network.py
 - 验证API端点可访问性
 - 提供访问建议
 
+## 测试API
+
+### 完整异步测试
+
+```bash
+# 运行完整测试脚本，演示异步工作流程
+python test_async_api.py
+```
+
+该脚本会：
+- ✅ 测试API连接和健康状态
+- 📋 列出可用的LoRA模型
+- 📊 显示任务管理功能
+- 🔄 提交异步任务并监控进度
+- 📥 下载生成的音频文件
+
 ## API 端点
 
 ### 1. 健康检查
@@ -103,7 +122,7 @@ GET /loras
 POST /synthesize
 ```
 
-核心接口，用于生成语音。
+核心接口，用于生成语音。支持同步和异步两种模式。
 
 **请求体:**
 ```json
@@ -114,11 +133,23 @@ POST /synthesize
   "steps": 10,                    // 可选，默认 10
   "seed": -1,                     // 可选，-1 为随机
   "ref_audio_path": "path/to/ref.wav",  // 可选，声音克隆
-  "ref_text": "参考音频的文本内容"       // 可选，声音克隆
+  "ref_text": "参考音频的文本内容",       // 可选，声音克隆
+  "async_mode": true              // 可选，默认 true，是否使用异步模式
 }
 ```
 
-**响应示例:**
+**异步模式响应 (默认):**
+```json
+{
+  "task_id": "abc12345",
+  "status": "submitted",
+  "message": "任务已提交，请使用task_id查询处理状态",
+  "estimated_time": 45,
+  "progress": 0.0
+}
+```
+
+**同步模式响应:**
 ```json
 {
   "task_id": "abc12345",
@@ -126,6 +157,54 @@ POST /synthesize
   "message": "Speech synthesized successfully",
   "audio_path": "api_outputs/tts_abc12345_1640995200.mp3",
   "sample_rate": 44100
+}
+```
+
+### 3.1 任务状态查询
+```
+GET /task/{task_id}
+```
+
+查询特定任务的状态和进度。
+
+**响应示例:**
+```json
+{
+  "task_id": "abc12345",
+  "status": "processing",
+  "message": "生成音频中...",
+  "progress": 0.6,
+  "created_at": "2023-12-14T12:00:00",
+  "updated_at": "2023-12-14T12:01:30",
+  "estimated_time": 45,
+  "audio_path": null
+}
+```
+
+**任务状态说明:**
+- `pending`: 等待处理
+- `processing`: 正在处理
+- `completed`: 处理完成
+- `failed`: 处理失败
+
+### 3.2 任务列表
+```
+GET /tasks?status=processing&limit=10
+```
+
+获取任务列表，支持状态过滤。
+
+**查询参数:**
+- `status`: 可选，过滤任务状态 (pending/processing/completed/failed)
+- `limit`: 可选，限制返回数量，默认50
+
+**响应示例:**
+```json
+{
+  "tasks": [...],
+  "total": 25,
+  "processing": 2,
+  "max_concurrent": 2
 }
 ```
 
@@ -155,14 +234,65 @@ DELETE /cleanup
 
 ### Python 客户端
 
+#### 异步工作流程（推荐用于长文本）
+
+```python
+import requests
+import time
+import json
+
+# 1. 提交异步任务
+response = requests.post("http://localhost:8000/synthesize", json={
+    "text": "这是一个很长的文本内容，需要进行异步处理..." * 10,
+    "lora_name": "lora1",
+    "cfg_scale": 2.0,
+    "steps": 15,
+    "seed": 42,
+    "async_mode": True  # 异步模式（默认）
+})
+
+result = response.json()
+if result["status"] == "submitted":
+    task_id = result["task_id"]
+    print(f"任务已提交: {task_id}")
+    print(f"预计处理时间: {result['estimated_time']}秒")
+
+    # 2. 轮询任务状态
+    while True:
+        status_response = requests.get(f"http://localhost:8000/task/{task_id}")
+        task_status = status_response.json()
+
+        print(f"任务状态: {task_status['status']}")
+        print(f"进度: {task_status.get('progress', 0)*100:.1f}%")
+        print(f"消息: {task_status.get('message', '')}")
+
+        if task_status["status"] == "completed":
+            print(f"任务完成! 音频文件: {task_status['audio_path']}")
+            # 下载音频文件
+            filename = task_status['audio_path'].split('/')[-1]
+            audio_response = requests.get(f"http://localhost:8000/download/{filename}")
+            with open("async_output.mp3", "wb") as f:
+                f.write(audio_response.content)
+            break
+        elif task_status["status"] == "failed":
+            print(f"任务失败: {task_status.get('error', '未知错误')}")
+            break
+
+        time.sleep(2)  # 每2秒查询一次
+```
+
+#### 同步工作流程（适用于短文本）
+
 ```python
 import requests
 
-# 基础语音合成
+# 同步模式 - 直接等待结果
 response = requests.post("http://localhost:8000/synthesize", json={
     "text": "Hello, this is a test of VoxCPM TTS API.",
+    "lora_name": "lora1",
     "cfg_scale": 2.0,
-    "steps": 10
+    "steps": 10,
+    "async_mode": False  # 同步模式
 })
 
 result = response.json()
@@ -170,24 +300,31 @@ if result["status"] == "success":
     print(f"Audio generated: {result['audio_path']}")
     # 下载音频文件
     audio_response = requests.get(f"http://localhost:8000/download/{result['audio_path'].split('/')[-1]}")
-    with open("output.mp3", "wb") as f:
+    with open("sync_output.mp3", "wb") as f:
         f.write(audio_response.content)
+```
 
-# 使用 LoRA 模型 (实际示例: lora1)
-response = requests.post("http://localhost:8000/synthesize", json={
-    "text": "Hello, this is synthesized using the lora1 model.",
-    "lora_name": "lora1",
-    "cfg_scale": 2.0,
-    "steps": 10,
-    "seed": 42
-})
+#### 任务管理示例
+
+```python
+# 查看所有任务
+response = requests.get("http://localhost:8000/tasks")
+all_tasks = response.json()
+print(f"总任务数: {all_tasks['total']}")
+print(f"正在处理: {all_tasks['processing']}/{all_tasks['max_concurrent']}")
+
+# 查看正在处理的任务
+response = requests.get("http://localhost:8000/tasks?status=processing")
+processing_tasks = response.json()
+for task in processing_tasks['tasks']:
+    print(f"任务ID: {task['task_id']}, 进度: {task['progress']*100:.1f}%")
 
 # 查看可用 LoRA 模型
 response = requests.get("http://localhost:8000/loras")
 loras = response.json()
 print(f"Available LoRAs: {loras['loras']}")
 
-# 声音克隆
+# 声音克隆示例
 response = requests.post("http://localhost:8000/synthesize", json={
     "text": "这是使用声音克隆技术合成的语音。",
     "ref_audio_path": "reference_audio.wav",
@@ -199,30 +336,69 @@ response = requests.post("http://localhost:8000/synthesize", json={
 
 ### curl 示例
 
+#### 异步工作流程
+
 ```bash
-# 基础语音合成
+# 1. 提交异步任务
+TASK_ID=$(curl -s -X POST "http://localhost:8000/synthesize" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "这是一个很长的文本内容，需要进行异步处理..." * 5,
+    "lora_name": "lora1",
+    "async_mode": true
+  }' | jq -r '.task_id')
+
+echo "任务已提交: $TASK_ID"
+
+# 2. 轮询任务状态
+while true; do
+  STATUS=$(curl -s "http://localhost:8000/task/$TASK_ID" | jq -r '.status')
+  PROGRESS=$(curl -s "http://localhost:8000/task/$TASK_ID" | jq -r '.progress')
+  MESSAGE=$(curl -s "http://localhost:8000/task/$TASK_ID" | jq -r '.message')
+
+  echo "状态: $STATUS, 进度: $(echo "$PROGRESS * 100" | bc)%, 消息: $MESSAGE"
+
+  if [ "$STATUS" = "completed" ]; then
+    AUDIO_PATH=$(curl -s "http://localhost:8000/task/$TASK_ID" | jq -r '.audio_path')
+    echo "任务完成! 音频文件: $AUDIO_PATH"
+    # 下载音频文件
+    curl -X GET "http://localhost:8000/download/$(basename $AUDIO_PATH)" -o async_output.mp3
+    break
+  elif [ "$STATUS" = "failed" ]; then
+    echo "任务失败"
+    break
+  fi
+
+  sleep 3
+done
+```
+
+#### 同步工作流程
+
+```bash
+# 同步模式 - 直接等待结果
 curl -X POST "http://localhost:8000/synthesize" \
   -H "Content-Type: application/json" \
   -d '{
     "text": "Hello, this is a test of VoxCPM TTS API.",
+    "lora_name": "lora1",
     "cfg_scale": 2.0,
-    "steps": 10
+    "steps": 10,
+    "async_mode": false
   }'
 
 # 列出 LoRA 模型
 curl -X GET "http://localhost:8000/loras"
 # 响应: {"loras":["lora1","20251214_173819/checkpoints/step_0000200",...], "count":6}
 
-# 使用 LoRA 模型 (已测试: lora1)
-curl -X POST "http://localhost:8000/synthesize" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Hello, this is synthesized using the lora1 model.",
-    "lora_name": "lora1",
-    "cfg_scale": 2.0,
-    "steps": 10,
-    "seed": 42
-  }'
+# 查看任务状态
+curl -X GET "http://localhost:8000/task/abc12345"
+
+# 查看所有任务
+curl -X GET "http://localhost:8000/tasks"
+
+# 查看正在处理的任务
+curl -X GET "http://localhost:8000/tasks?status=processing"
 
 # 下载音频文件 (替换为实际文件名)
 curl -X GET "http://localhost:8000/download/tts_c0490f9f_1765715910.mp3" \
@@ -282,29 +458,42 @@ synthesizeSpeech("你好，世界！", "chinese_lora_model");
 
 ```
 VoxCPM/
-├── api_server.py           # API 服务器主文件
-├── requirements_api.txt    # API 相关依赖
-├── example_usage.py       # 使用示例
-├── README_API.md         # API 文档
+├── api_server.py           # API 服务器主文件 (完整功能)
+├── start_api.py           # 启动脚本 (支持多种配置选项)
+├── requirements_api.txt    # API 相关依赖包
+├── test_async_api.py      # 完整异步测试脚本
+├── test_network.py        # 网络配置测试工具
+├── example_usage.py       # 基础使用示例
+├── README_API.md         # API 详细文档
 ├── lora/                 # LoRA 模型目录
-│   ├── model1/
+│   ├── lora1/            # 示例LoRA模型
 │   │   ├── lora_weights.safetensors
 │   │   └── lora_config.json
-│   └── model2/
-│       ├── lora_weights.safetensors
-│       └── lora_config.json
+│   └── [其他LoRA模型]/
 └── api_outputs/          # 生成的音频文件输出目录
-    ├── tts_abc123_1640995200.mp3
-    └── tts_def456_1640995300.mp3
+    ├── tts_[task_id]_[timestamp].mp3
+    └── ...
 ```
 
 ## 注意事项
 
 1. **LoRA 模型路径**: LoRA 模型应放在 `lora/` 目录下，每个模型文件夹需包含 `lora_weights.safetensors` 文件
 2. **音频格式**: API 自动输出 MP3 格式音频文件
-3. **文件清理**: 建议定期调用 `/cleanup` 端点清理旧文件
-4. **并发处理**: 模型会自动缓存，首次加载可能较慢，后续请求会更快
-5. **错误处理**: 所有错误都会返回详细的错误信息
+3. **异步处理**:
+   - 默认使用异步模式，避免长文本处理时的HTTP超时
+   - 异步任务立即返回task_id，需要轮询状态获取结果
+   - 同步模式适用于短文本，会直接等待结果
+4. **模型加载**: 首次调用时需要加载模型，可能需要较长时间（1-3分钟）
+5. **并发限制**: 后台默认同时处理1个任务，确保资源合理使用
+6. **文件清理**: 建议定期调用 `/cleanup` 端点清理旧文件
+7. **错误处理**: 所有错误都会返回详细的错误信息
+
+## 性能优化建议
+
+1. **批量处理**: 对于大量请求，建议使用异步客户端进行批量处理
+2. **模型预热**: 首次请求前可以先用短文本预热模型
+3. **内存管理**: 监控服务器内存使用，必要时重启服务
+4. **文件存储**: 考虑使用对象存储服务替代本地文件存储
 
 ## 故障排除
 
