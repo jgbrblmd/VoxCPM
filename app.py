@@ -1,12 +1,16 @@
 import os
 import numpy as np
 import torch
-import gradio as gr  
+import gradio as gr
 import spaces
 from typing import Optional, Tuple
 from funasr import AutoModel
 from pathlib import Path
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Apply ROCm compatibility patches
+import rocm_patch
+rocm_patch.apply_patches()
 if os.environ.get("HF_REPO_ID", "").strip() == "":
     os.environ["HF_REPO_ID"] = "openbmb/VoxCPM1.5"
 
@@ -20,11 +24,15 @@ class VoxCPMDemo:
 
         # ASR model for prompt text recognition
         self.asr_model_id = "iic/SenseVoiceSmall"
+        # Use CPU for ASR model on ROCm due to compatibility issues
+        asr_device = "cpu" if self.device == "cuda" and "rocm" in torch.__version__.lower() else ("cuda:0" if self.device == "cuda" else "cpu")
+        if asr_device == "cpu":
+            print("Forcing ASR model to CPU due to ROCm compatibility")
         self.asr_model: Optional[AutoModel] = AutoModel(
             model=self.asr_model_id,
             disable_update=True,
             log_level='DEBUG',
-            device="cuda:0" if self.device == "cuda" else "cpu",
+            device=asr_device,
         )
 
         # TTS model (lazy init)
@@ -271,4 +279,4 @@ def run_demo(server_name: str = "localhost", server_port: int = 7860, show_error
 
 
 if __name__ == "__main__":
-    run_demo()
+    run_demo(server_name="0.0.0.0")
